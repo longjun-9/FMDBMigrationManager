@@ -1,5 +1,6 @@
 xcodeproj 'Tests/FMDBMigrationManagerTests'
 workspace 'FMDBMigrationManager'
+inhibit_all_warnings!
 
 def import_pods
   pod 'Expecta', '~> 0.3.0'
@@ -7,14 +8,12 @@ def import_pods
   pod 'FMDBMigrationManager', :path => '.'
 end
 
-target :ios do
-  platform :ios, '7.0'
-  link_with 'iOS Tests'
+target 'iOS Tests' do
+  platform :ios, '8.0'
   import_pods
 end
 
-target :osx do
+target 'OS X Tests' do
   platform :osx, '10.9'
-  link_with 'OS X Tests'
   import_pods
 end
