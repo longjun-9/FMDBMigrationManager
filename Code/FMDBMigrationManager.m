@@ -62,6 +62,7 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
 @interface FMDBMigrationManager ()
 @property (nonatomic) FMDatabase *database;
 @property (nonatomic, assign) BOOL shouldCloseOnDealloc;
+@property (nonatomic, assign) BOOL writeVersionsOnly;
 @property (nonatomic) NSArray *migrations;
 @property (nonatomic) NSMutableArray *externalMigrations;
 @end
@@ -70,17 +71,27 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
 
 + (instancetype)managerWithDatabaseAtPath:(NSString *)path migrationsBundle:(NSBundle *)bundle
 {
+    BOOL writeVersionsOnly = NO;
+    // 首先检测本地有没有数据库文件
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        writeVersionsOnly = YES;
+    }
     FMDatabase *database = [FMDatabase databaseWithPath:path];
-    return [[self alloc] initWithDatabase:database migrationsBundle:bundle];
+    return [[self alloc] initWithDatabase:database migrationsBundle:bundle writeVersionsOnly:writeVersionsOnly];
 }
 
 + (instancetype)managerWithDatabase:(FMDatabase *)database migrationsBundle:(NSBundle *)bundle
 {
-    return [[self alloc] initWithDatabase:database migrationsBundle:bundle];
+    BOOL writeVersionsOnly = NO;
+    // 首先检测本地有没有数据库文件
+    if (![[NSFileManager defaultManager] fileExistsAtPath:database.databasePath]) {
+        writeVersionsOnly = YES;
+    }
+    return [[self alloc] initWithDatabase:database migrationsBundle:bundle writeVersionsOnly:writeVersionsOnly];
 }
 
 // Designated initializer
-- (id)initWithDatabase:(FMDatabase *)database migrationsBundle:(NSBundle *)migrationsBundle
+- (id)initWithDatabase:(FMDatabase *)database migrationsBundle:(NSBundle *)migrationsBundle writeVersionsOnly:(BOOL)writeVersionsOnly
 {
     if (!database) [NSException raise:NSInvalidArgumentException format:@"Cannot initialize a `%@` with nil `database`.", [self class]];
     if (!migrationsBundle) [NSException raise:NSInvalidArgumentException format:@"Cannot initialize a `%@` with nil `migrationsBundle`.", [self class]];
@@ -89,10 +100,15 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
         _database = database;
         _migrationsBundle = migrationsBundle;
         _dynamicMigrationsEnabled = YES;
+        _writeVersionsOnly = writeVersionsOnly;
         _externalMigrations = [NSMutableArray new];
         if (![database goodConnection]) {
             self.shouldCloseOnDealloc = YES;
             [database open];
+        }
+        
+        if (!self.hasMigrationsTable) {
+            [self createMigrationsTable:nil];
         }
     }
     return self;
@@ -140,7 +156,7 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
         version = [resultSet unsignedLongLongIntForColumnIndex:0];
     }
     [resultSet close];
-    return version;;
+    return version;
 }
 
 - (uint64_t)originVersion
@@ -158,24 +174,30 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
 
 - (NSArray *)appliedVersions
 {
-    if (!self.hasMigrationsTable) return nil;
-    
-    NSMutableArray *versions = [NSMutableArray new];
-    FMResultSet *resultSet = [self.database executeQuery:@"SELECT version FROM schema_migrations"];
-    while ([resultSet next]) {
-        uint64_t version = [resultSet unsignedLongLongIntForColumnIndex:0];
-        [versions addObject:@(version)];
+    uint64_t currentVersion = self.currentVersion;
+    NSArray *appliedVersions = nil;
+    if (currentVersion != 0) {
+        NSMutableArray *pendingVersions = [NSMutableArray array];
+        NSMutableArray *originVersions = [[[self migrations] valueForKey:@"version"] mutableCopy];
+        for (NSNumber *num in originVersions) {
+            uint64_t version = [num unsignedLongLongValue];
+            if (version > currentVersion) {
+                [pendingVersions addObject:num];
+            }
+        }
+        [originVersions removeObjectsInArray:pendingVersions];
+        appliedVersions = [originVersions sortedArrayUsingSelector:@selector(compare:)];
     }
-    [resultSet close];
-    return [versions sortedArrayUsingSelector:@selector(compare:)];
+    return appliedVersions;
 }
 
 - (NSArray *)pendingVersions
 {
     if (!self.hasMigrationsTable) return [[self.migrations valueForKey:@"version"] sortedArrayUsingSelector:@selector(compare:)];
-    
+
     NSMutableArray *pendingVersions = [[[self migrations] valueForKey:@"version"] mutableCopy];
     [pendingVersions removeObjectsInArray:self.appliedVersions];
+
     return [pendingVersions sortedArrayUsingSelector:@selector(compare:)];
 }
 
@@ -263,11 +285,15 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
             break;
         }
         id<FMDBMigrating> migration = [self migrationForVersion:migrationVersion];
-        success = [migration migrateDatabase:self.database error:error];
-        if (!success) {
-            [self.database rollback];
-            break;
+        
+        if (!self.writeVersionsOnly) {
+            success = [migration migrateDatabase:self.database error:error];
+            if (!success) {
+                [self.database rollback];
+                break;
+            }
         }
+        
         success = [self.database executeUpdate:@"INSERT INTO schema_migrations(version) VALUES (?)", @(migration.version)];
         if (!success) {
             [self.database rollback];
